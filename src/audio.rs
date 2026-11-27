@@ -41,7 +41,7 @@ impl AppKey {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub enum Channel {
     Master,
     App(AppKey),
