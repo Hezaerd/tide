@@ -1,6 +1,6 @@
 use std::{
     sync::{Arc, OnceLock},
-    time::{Duration, Instant},
+    time::Instant,
 };
 
 use rune::{AppHandle, Tray, TrayError, TrayEvent, TrayIcon, TrayItem, TraySpec};
@@ -15,6 +15,10 @@ use windows::Win32::{
 use winshell::{Autostart, Mark, Taskbar};
 
 use crate::ui::State;
+
+mod taskbar;
+
+use taskbar::TaskbarWatcher;
 
 const AUTOSTART: Autostart = Autostart::new("Tide");
 const MARKS: &[Mark] = &[
@@ -54,7 +58,7 @@ fn menu() -> Vec<TrayItem> {
     ]
 }
 
-pub fn install(handle: AppHandle<State>) -> Result<Arc<Tray>, TrayError> {
+pub fn install(handle: AppHandle<State>) -> Result<(Option<TaskbarWatcher>, Arc<Tray>), TrayError> {
     let mut current = Taskbar::current().mark(MARKS);
     let slot = Arc::new(OnceLock::<std::sync::Weak<Tray>>::new());
     let callback_tray = slot.clone();
@@ -82,17 +86,19 @@ pub fn install(handle: AppHandle<State>) -> Result<Arc<Tray>, TrayError> {
     )?);
     let _ = slot.set(Arc::downgrade(&tray));
     let refresh = Arc::downgrade(&tray);
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(2));
-            let Some(tray) = refresh.upgrade() else { break };
-            let next = Taskbar::current().mark(MARKS);
-            if next != current && tray.set_icon(mark(next)).is_ok() {
-                current = next;
-            }
+    let watcher = TaskbarWatcher::start(move || {
+        let Some(tray) = refresh.upgrade() else {
+            return false;
+        };
+        let next = Taskbar::current().mark(MARKS);
+        if next != current && tray.set_icon(mark(next)).is_ok() {
+            current = next;
         }
-    });
-    Ok(tray)
+        true
+    })
+    .inspect_err(|error| eprintln!("Tide could not watch the taskbar: {error}"))
+    .ok();
+    Ok((watcher, tray))
 }
 
 #[derive(Clone, Copy, Debug)]
