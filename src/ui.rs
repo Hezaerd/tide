@@ -13,7 +13,9 @@ use rune::{
 use rune_kit::{ScrollBar, ScrollBarStyle};
 
 use crate::{
-    audio::{AppInfo, AppKey, Channel, Command, CommandSender, Peaks, Snapshot, Update},
+    audio::{
+        AppInfo, AppKey, Channel, Command, CommandSender, Device, DeviceId, Peaks, Snapshot, Update,
+    },
     theme::{self, Theme},
     tray::{self, Placement},
 };
@@ -52,6 +54,23 @@ pub enum ToggleSource {
     Hotkey,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+enum View {
+    #[default]
+    Mixer,
+    Devices,
+    Switching,
+}
+
+impl View {
+    fn row_count(self, snapshot: &Snapshot) -> usize {
+        match self {
+            Self::Devices => snapshot.devices.len(),
+            Self::Mixer | Self::Switching => snapshot.apps.len(),
+        }
+    }
+}
+
 pub struct State {
     snapshot: Snapshot,
     peaks: Peaks,
@@ -61,6 +80,7 @@ pub struct State {
     window: Option<AppHandle<Self>>,
     tray: Weak<Tray>,
     panel: Panel,
+    view: View,
     lost_focus_at: Option<Instant>,
     generation: u64,
     revision: u64,
@@ -79,6 +99,7 @@ impl State {
             window: None,
             tray: Weak::new(),
             panel: Panel::Closed,
+            view: View::Mixer,
             lost_focus_at: None,
             generation: 0,
             revision: 0,
@@ -140,7 +161,12 @@ impl State {
             Panel::Opening(placement, source) => (placement, Some(source)),
             Panel::Open(placement) => (placement, None),
         };
-        let count_changed = self.snapshot.apps.len() != update.snapshot.apps.len();
+        let old_count = self.view.row_count(&self.snapshot);
+        if self.view == View::Switching
+            || self.view == View::Devices && update.snapshot.devices.len() < 2
+        {
+            self.view = View::Mixer;
+        }
         for app in &update.snapshot.apps {
             if let Some(icon) = &app.icon {
                 self.pixels.entry(app.key.clone()).or_insert_with(|| {
@@ -154,21 +180,67 @@ impl State {
         }
         self.snapshot = update.snapshot;
         self.peaks = update.peaks;
-        if let Some(window) = &self.window {
-            if opening.is_some() || count_changed {
-                let height = panel_height(self.snapshot.apps.len(), placement.max_height());
-                window.set_position(placement.position(WIDTH, height));
-                tx.resize_window_instant((WIDTH, height));
+        if opening.is_some() || old_count != self.view.row_count(&self.snapshot) {
+            self.resize_panel(placement, tx);
+        }
+        if let Some(source) = opening
+            && let Some(window) = &self.window
+        {
+            self.panel = Panel::Open(placement);
+            if matches!(source, ToggleSource::Hotkey) {
+                tx.focus_when_shown(MASTER_ROW_KEY, true);
             }
-            if let Some(source) = opening {
-                self.panel = Panel::Open(placement);
-                if matches!(source, ToggleSource::Hotkey) {
-                    tx.focus_when_shown(MASTER_ROW_KEY, true);
-                }
-                window.open();
-            }
+            window.open();
         }
         true
+    }
+
+    fn resize_panel(&self, placement: Placement, tx: &mut Tx) {
+        if let Some(window) = &self.window {
+            let height = panel_height(self.view.row_count(&self.snapshot), placement.max_height());
+            window.set_position(placement.position(WIDTH, height));
+            tx.resize_window_instant((WIDTH, height));
+        }
+    }
+
+    fn show_view(&mut self, view: View, tx: &mut Tx) {
+        self.view = view;
+        if let Panel::Open(placement) = self.panel {
+            self.resize_panel(placement, tx);
+        }
+    }
+
+    fn toggle_devices(&mut self, tx: &mut Tx) {
+        match self.view {
+            View::Mixer if self.snapshot.devices.len() >= 2 => {
+                self.show_view(View::Devices, tx);
+                let device = self
+                    .snapshot
+                    .devices
+                    .iter()
+                    .find(|device| Some(&device.id) == self.snapshot.device_id.as_ref())
+                    .unwrap_or(&self.snapshot.devices[0]);
+                tx.focus(device_key(&device.id), true);
+            }
+            View::Devices => self.show_view(View::Mixer, tx),
+            _ => {}
+        }
+    }
+
+    fn choose_device(&mut self, id: &DeviceId, tx: &mut Tx) {
+        if self.view != View::Devices
+            || !self.snapshot.devices.iter().any(|device| &device.id == id)
+        {
+            return;
+        }
+        let view = if self.send(Command::SetDefaultDevice(id.clone())) {
+            self.revision += 1;
+            View::Switching
+        } else {
+            View::Mixer
+        };
+        self.show_view(view, tx);
+        tx.return_focus("device", true);
     }
 
     fn close(&mut self, tx: &mut Tx) {
@@ -178,6 +250,7 @@ impl State {
 
     pub fn closed(&mut self, _: &mut Tx) {
         self.volume_scroll = None;
+        self.view = View::Mixer;
         if !matches!(self.panel, Panel::Closed) {
             self.panel = Panel::Closed;
             self.send(Command::Close);
@@ -199,7 +272,12 @@ impl State {
         if event.key != Key::Escape {
             return false;
         }
-        self.close(tx);
+        if self.view == View::Devices {
+            self.show_view(View::Mixer, tx);
+            tx.return_focus("device", true);
+        } else {
+            self.close(tx);
+        }
         true
     }
 
@@ -253,6 +331,9 @@ impl State {
     }
 
     fn change(&mut self, channel: &Channel, change: Change) {
+        if self.view == View::Switching {
+            return;
+        }
         let Some((volume, muted)) = self.snapshot.channel_mut(channel) else {
             return;
         };
@@ -324,6 +405,101 @@ fn label(value: impl Into<String>, style: TextStyle, color: Color) -> El {
     text(value.into()).font(style).color(color).truncate()
 }
 
+fn device_key(id: &DeviceId) -> String {
+    format!("output:{}", id.0)
+}
+
+fn device_header(state: &State, t: Theme) -> El {
+    let snapshot = &state.snapshot;
+    let name = label(
+        &snapshot.device,
+        TextStyle::new(12.5, 600.0).lh(16.0),
+        t.text,
+    )
+    .min_w(0.0);
+    if snapshot.devices.len() < 2 {
+        return name.key("device").grow(1.0);
+    }
+
+    let expanded = state.view == View::Devices;
+    let (edge, point) = if expanded { (8.0, 4.0) } else { (4.0, 8.0) };
+    row()
+        .key("device")
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(5.0)
+        .items_center()
+        .radius(4.0)
+        .hover(t.hover)
+        .focus_ring(2.0, -1.0, t.sub)
+        .cursor(Cursor::Pointer)
+        .focusable(true)
+        .press_on_return()
+        .role("button")
+        .label(format!("Output device, {}", snapshot.device))
+        .expanded(expanded)
+        .on_press_tx(State::toggle_devices)
+        .child(name.key("name").shrink())
+        .child(
+            canvas(
+                Shape::new()
+                    .view_box(12.0, 12.0)
+                    .line([2.0, edge], [6.0, point], 1.4, LineCap::Round, t.sub)
+                    .line([6.0, point], [10.0, edge], 1.4, LineCap::Round, t.sub),
+            )
+            .key("chevron")
+            .size(12.0, 12.0)
+            .a11y_hidden(),
+        )
+}
+
+fn device_row(device: &Device, current: Option<&DeviceId>, t: Theme) -> El {
+    let selected = current == Some(&device.id);
+    let id = device.id.clone();
+    let row = row()
+        .key(device_key(&id))
+        .w_full()
+        .h(ROW_HEIGHT)
+        .px(8.0)
+        .gap(10.0)
+        .items_center()
+        .radius(9.0)
+        .hover(t.hover)
+        .focusable(true)
+        .press_on_return()
+        .focus_ring(2.0, -1.0, t.sub)
+        .cursor(Cursor::Pointer)
+        .role("radio")
+        .label(&device.name)
+        .checked(selected)
+        .on_press_tx(move |s: &mut State, tx| s.choose_device(&id, tx))
+        .child(
+            label(
+                &device.name,
+                TextStyle::new(12.5, if selected { 600.0 } else { 400.0 }).lh(16.0),
+                t.text,
+            )
+            .key("name")
+            .grow(1.0)
+            .min_w(0.0),
+        );
+    if selected {
+        row.fill(t.hover).child(
+            canvas(
+                Shape::new()
+                    .view_box(16.0, 16.0)
+                    .line([3.0, 8.0], [6.0, 11.0], 1.6, LineCap::Round, t.text)
+                    .line([6.0, 11.0], [13.0, 4.0], 1.6, LineCap::Round, t.text),
+            )
+            .key("check")
+            .size(16.0, 16.0)
+            .a11y_hidden(),
+        )
+    } else {
+        row
+    }
+}
+
 pub fn view(state: &State, cx: &mut Cx<State>) -> El {
     let dark = state
         .scene
@@ -331,7 +507,7 @@ pub fn view(state: &State, cx: &mut Cx<State>) -> El {
     let t = Theme::new(dark);
     let snapshot = &state.snapshot;
 
-    let count = snapshot.apps.len();
+    let count = state.view.row_count(snapshot);
     let header = row()
         .key("header")
         .h(26.0)
@@ -341,24 +517,19 @@ pub fn view(state: &State, cx: &mut Cx<State>) -> El {
         .gap(8.0)
         .items_center()
         .child(theme::wave(t.sub))
-        .child(
-            label(
-                &snapshot.device,
-                TextStyle::new(12.5, 600.0).lh(16.0),
-                t.text,
-            )
-            .key("device")
-            .grow(1.0)
-            .min_w(0.0),
-        )
-        .child(
+        .child(device_header(state, t));
+    let header = if state.view == View::Devices {
+        header
+    } else {
+        header.child(
             label(
                 format!("{count} {}", if count == 1 { "app" } else { "apps" }),
                 TextStyle::new(11.5, 400.0).lh(16.0).features("'tnum' 1"),
                 t.sub,
             )
             .key("count"),
-        );
+        )
+    };
 
     let master = MixerRow {
         channel: Channel::Master,
@@ -372,25 +543,39 @@ pub fn view(state: &State, cx: &mut Cx<State>) -> El {
     }
     .element(t);
 
-    let content = col()
-        .key("app-list")
-        .w_full()
-        .children(snapshot.apps.iter().map(|app| {
-            MixerRow {
-                channel: Channel::App(app.key.clone()),
-                name: app.name.as_str(),
-                volume: app.volume,
-                muted: app.muted,
-                streams: app.streams,
-                accent: theme::rgb(app.accent),
-                peak: state.peaks.get(&app.key),
-                pixels: state
-                    .pixels
-                    .get(&app.key)
-                    .map(|p| &p[usize::from(app.muted)]),
-            }
-            .element(t)
-        }));
+    let content = if state.view == View::Devices {
+        col()
+            .key("device-list")
+            .w_full()
+            .role("radiogroup")
+            .label("Output devices")
+            .children(
+                snapshot
+                    .devices
+                    .iter()
+                    .map(|device| device_row(device, snapshot.device_id.as_ref(), t)),
+            )
+    } else {
+        col()
+            .key("app-list")
+            .w_full()
+            .children(snapshot.apps.iter().map(|app| {
+                MixerRow {
+                    channel: Channel::App(app.key.clone()),
+                    name: &app.name,
+                    volume: app.volume,
+                    muted: app.muted,
+                    streams: app.streams,
+                    accent: theme::rgb(app.accent),
+                    peak: state.peaks.get(&app.key),
+                    pixels: state
+                        .pixels
+                        .get(&app.key)
+                        .map(|p| &p[usize::from(app.muted)]),
+                }
+                .element(t)
+            }))
+    };
     let list_height = panel_height(count, state.max_height()) - FRAME_HEIGHT;
     let overflow = list_height < ROW_HEIGHT * count as f32;
     let list = if overflow {
@@ -682,6 +867,10 @@ pub const SCENES: &[Scene] = &[
     ("dark", |state| fake(state, true, false, 6)),
     ("muted", |state| fake(state, false, true, 6)),
     ("scroll", |state| fake(state, true, true, 14)),
+    ("devices", |state| {
+        fake(state, true, false, 6);
+        state.view = View::Devices;
+    }),
 ];
 
 fn fake(state: &mut State, dark: bool, muted: bool, count: usize) {
@@ -704,6 +893,18 @@ fn fake(state: &mut State, dark: bool, muted: bool, count: usize) {
     state.scene = Some((dark, if count > 6 { 411.0 } else { 351.0 }));
     state.snapshot = Snapshot {
         device: "Speakers (Yeti Classic)".into(),
+        device_id: Some(DeviceId("speakers".into())),
+        devices: [
+            ("speakers", "Speakers (Yeti Classic)"),
+            ("headphones", "Headphones (Bluetooth)"),
+            ("monitor", "Monitor (HDMI Audio)"),
+        ]
+        .into_iter()
+        .map(|(id, name)| Device {
+            id: DeviceId(id.into()),
+            name: name.into(),
+        })
+        .collect(),
         master_volume: 0.50,
         master_muted: false,
         apps: fixtures
@@ -806,5 +1007,50 @@ mod tests {
         assert_eq!(panel_height(0, 400.0), 99.0);
         assert_eq!(panel_height(3, 400.0), 225.0);
         assert_eq!(panel_height(14, 400.0), 400.0);
+    }
+
+    #[test]
+    fn output_picker_needs_two_devices_and_escape_returns_to_mixer() {
+        let mut state = State::new();
+        let mut tx = Tx::default();
+        fake(&mut state, true, false, 6);
+        state.toggle_devices(&mut tx);
+        assert_eq!(state.view.row_count(&state.snapshot), 3);
+
+        let escape = KeyEvent {
+            key: Key::Escape,
+            mods: Default::default(),
+        };
+        assert!(state.key(&escape, &mut tx));
+        assert_eq!(state.view, View::Mixer);
+        assert_eq!(state.view.row_count(&state.snapshot), 6);
+
+        state.toggle_devices(&mut tx);
+        state.closed(&mut tx);
+        assert_eq!(state.view, View::Mixer);
+        state.snapshot.devices.truncate(1);
+        state.toggle_devices(&mut tx);
+        assert_eq!(state.view, View::Mixer);
+    }
+
+    #[test]
+    fn selecting_a_device_sends_its_id_and_shows_the_mixer() {
+        let (command, next) = crate::audio::test_channel();
+        let mut state = State {
+            command: Some(command),
+            ..State::new()
+        };
+        fake(&mut state, true, false, 6);
+        let mut tx = Tx::default();
+        state.toggle_devices(&mut tx);
+        state.choose_device(&DeviceId("headphones".into()), &mut tx);
+
+        assert!(
+            matches!(next(), Some(Command::SetDefaultDevice(DeviceId(id))) if id == "headphones")
+        );
+        assert_eq!(state.view.row_count(&state.snapshot), 6);
+        state.change(&Channel::Master, Change::Set(0.0));
+        assert!(next().is_none());
+        assert_eq!(state.snapshot.master_volume, 0.50);
     }
 }

@@ -14,8 +14,64 @@ use windows::{
         Media::Audio::{Endpoints::*, *},
         System::{Com::*, Threading::*},
     },
-    core::{Interface, PWSTR, Result},
+    core::{Interface, PCWSTR, PWSTR, Result},
 };
+
+mod policy {
+    use std::ffi::c_void;
+    use windows::{
+        Win32::{
+            Foundation::PROPERTYKEY,
+            Media::Audio::{ERole, WAVEFORMATEX, WAVEFORMATEXTENSIBLE},
+            System::Com::StructuredStorage::PROPVARIANT,
+        },
+        core::{GUID, HRESULT, IUnknown, IUnknown_Vtbl, PCWSTR, interface},
+    };
+
+    pub const POLICY_CONFIG_CLIENT: GUID = GUID::from_u128(0x870af99c_171d_4f9e_af0d_e63df40c2bc9);
+
+    #[interface("f8679f50-850a-41cf-9c72-430f290290c8")]
+    pub unsafe trait IPolicyConfig: IUnknown {
+        fn get_mix_format(&self, id: PCWSTR, format: *mut *mut WAVEFORMATEX) -> HRESULT;
+        fn get_device_format(
+            &self,
+            id: PCWSTR,
+            default: i32,
+            format: *mut *mut WAVEFORMATEXTENSIBLE,
+        ) -> HRESULT;
+        fn reset_device_format(&self, id: PCWSTR) -> HRESULT;
+        fn set_device_format(
+            &self,
+            id: PCWSTR,
+            endpoint: *mut WAVEFORMATEXTENSIBLE,
+            mix: *mut WAVEFORMATEXTENSIBLE,
+        ) -> HRESULT;
+        fn get_processing_period(
+            &self,
+            id: PCWSTR,
+            default: i32,
+            period: *mut i64,
+            minimum: *mut i64,
+        ) -> HRESULT;
+        fn set_processing_period(&self, id: PCWSTR, period: *mut i64) -> HRESULT;
+        fn get_share_mode(&self, id: PCWSTR, mode: *mut c_void) -> HRESULT;
+        fn set_share_mode(&self, id: PCWSTR, mode: *mut c_void) -> HRESULT;
+        fn get_property_value(
+            &self,
+            id: PCWSTR,
+            key: *const PROPERTYKEY,
+            value: *mut PROPVARIANT,
+        ) -> HRESULT;
+        fn set_property_value(
+            &self,
+            id: PCWSTR,
+            key: *const PROPERTYKEY,
+            value: *mut PROPVARIANT,
+        ) -> HRESULT;
+        pub fn set_default_endpoint(&self, id: PCWSTR, role: ERole) -> HRESULT;
+        fn set_endpoint_visibility(&self, id: PCWSTR, visible: i32) -> HRESULT;
+    }
+}
 
 const REFRESH: Duration = Duration::from_secs(1);
 const PEAK_INTERVAL: Duration = Duration::from_millis(33);
@@ -55,9 +111,20 @@ pub struct AppInfo {
     pub streams: usize,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeviceId(pub String);
+
+#[derive(Clone)]
+pub struct Device {
+    pub id: DeviceId,
+    pub name: String,
+}
+
 #[derive(Clone)]
 pub struct Snapshot {
     pub device: String,
+    pub device_id: Option<DeviceId>,
+    pub devices: Vec<Device>,
     pub master_volume: f32,
     pub master_muted: bool,
     pub apps: Vec<AppInfo>,
@@ -80,6 +147,8 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             device: String::from("No output device"),
+            device_id: None,
+            devices: Vec::new(),
             master_volume: 0.0,
             master_muted: false,
             apps: Vec::new(),
@@ -101,6 +170,7 @@ pub enum Command {
     Close,
     SetVolume(Channel, f32),
     SetMute(Channel, bool),
+    SetDefaultDevice(DeviceId),
 }
 
 enum Message {
@@ -114,6 +184,16 @@ impl CommandSender {
     pub fn send(&self, command: Command) -> bool {
         self.0.send(Message::Command(command)).is_ok()
     }
+}
+
+#[cfg(test)]
+pub fn test_channel() -> (CommandSender, impl Fn() -> Option<Command>) {
+    let (tx, rx) = mpsc::channel();
+    let next = move || match rx.try_recv() {
+        Ok(Message::Command(command)) => Some(command),
+        _ => None,
+    };
+    (CommandSender(Arc::new(tx)), next)
 }
 
 pub fn start(
@@ -343,6 +423,10 @@ impl Worker {
                 },
             };
             let opening = matches!(command, Some(Message::Command(Command::Open)));
+            let switching = matches!(
+                command,
+                Some(Message::Command(Command::SetDefaultDevice(_)))
+            );
             match command {
                 Some(Message::Command(Command::Close)) => {
                     next_tick = None;
@@ -364,6 +448,10 @@ impl Worker {
                         *current = muted;
                     }
                 }
+                Some(Message::Command(Command::SetDefaultDevice(id))) => {
+                    self.revision += 1;
+                    let _ = set_default_device(&id);
+                }
                 Some(Message::Command(Command::Open)) => {
                     generation += 1;
                     self.revision = 0;
@@ -379,7 +467,7 @@ impl Worker {
                 None => {}
             }
             let now = Instant::now();
-            if opening || next_tick.is_some() && now >= refresh_at {
+            if opening || next_tick.is_some() && (switching || now >= refresh_at) {
                 snapshot = self.refresh();
                 self.poll_peaks();
                 publish(self.update(&snapshot, generation));
@@ -407,34 +495,32 @@ impl Worker {
     }
 
     fn refresh(&mut self) -> Snapshot {
-        match self.read_output() {
-            Ok((snapshot, output)) => {
-                self.output = Some(output);
-                snapshot
-            }
-            Err(_) => {
-                self.output = None;
-                self.master_peak.set(0.0);
-                Snapshot::default()
-            }
+        let mut snapshot = Snapshot::default();
+        self.output = self.read_output(&mut snapshot).ok();
+        if self.output.is_none() {
+            self.master_peak.set(0.0);
         }
+        snapshot
     }
 
-    fn read_output(&mut self) -> Result<(Snapshot, Output)> {
+    fn read_output(&mut self, snapshot: &mut Snapshot) -> Result<Output> {
         // SAFETY: the audio worker owns this MTA and every WASAPI interface here.
         unsafe {
             if self.enumerator.is_none() {
                 self.enumerator = Some(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?);
             }
             let enumerator = self.enumerator.as_ref().unwrap();
+            snapshot.devices = active_devices(enumerator).unwrap_or_default();
             let device = enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
+            snapshot.device_id = device_id(&device).ok();
+            snapshot.device = snapshot
+                .devices
+                .iter()
+                .find(|entry| Some(&entry.id) == snapshot.device_id.as_ref())
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| device_name(&device, "Default output"));
             let endpoint: IAudioEndpointVolume = device.Activate(CLSCTX_ALL, None)?;
             let meter = device.Activate(CLSCTX_ALL, None).ok();
-            let device_name = device
-                .OpenPropertyStore(STGM_READ)
-                .and_then(|store| store.GetValue(&PKEY_Device_FriendlyName))
-                .map(|value| value.to_string())
-                .unwrap_or_else(|_| String::from("Default output"));
             let master_volume = endpoint.GetMasterVolumeLevelScalar()?;
             let master_muted = endpoint.GetMute()?.as_bool();
             let manager: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None)?;
@@ -508,19 +594,14 @@ impl Worker {
                     .entry(app.key.clone())
                     .or_insert_with(|| Live::new(0.0));
             }
-            Ok((
-                Snapshot {
-                    device: device_name,
-                    master_volume,
-                    master_muted,
-                    apps,
-                },
-                Output {
-                    endpoint,
-                    meter,
-                    sessions,
-                },
-            ))
+            snapshot.master_volume = master_volume;
+            snapshot.master_muted = master_muted;
+            snapshot.apps = apps;
+            Ok(Output {
+                endpoint,
+                meter,
+                sessions,
+            })
         }
     }
 
@@ -574,6 +655,54 @@ impl Worker {
     }
 }
 
+fn active_devices(enumerator: &IMMDeviceEnumerator) -> Result<Vec<Device>> {
+    // SAFETY: the enumeration and its endpoint interfaces stay in the owning MTA.
+    unsafe {
+        let devices = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
+        Ok((0..devices.GetCount()?)
+            .filter_map(|index| {
+                let device = devices.Item(index).ok()?;
+                Some(Device {
+                    id: device_id(&device).ok()?,
+                    name: device_name(&device, "Output device"),
+                })
+            })
+            .collect())
+    }
+}
+
+fn device_id(device: &IMMDevice) -> Result<DeviceId> {
+    // SAFETY: GetId returns a NUL-terminated task allocation on success.
+    unsafe { device.GetId().map(|id| DeviceId(take_string(id))) }
+}
+
+fn device_name(device: &IMMDevice, fallback: &str) -> String {
+    // SAFETY: the property store belongs to the current MTA.
+    unsafe {
+        device
+            .OpenPropertyStore(STGM_READ)
+            .and_then(|store| store.GetValue(&PKEY_Device_FriendlyName))
+            .map(|value| value.to_string())
+            .ok()
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| fallback.into())
+    }
+}
+
+fn set_endpoint_role(config: &policy::IPolicyConfig, id: &DeviceId, role: ERole) -> Result<()> {
+    let id: Vec<_> = id.0.encode_utf16().chain([0]).collect();
+    // SAFETY: the ID buffer is NUL-terminated and lives through the COM call.
+    unsafe { config.set_default_endpoint(PCWSTR(id.as_ptr()), role).ok() }
+}
+
+fn set_default_device(id: &DeviceId) -> Result<()> {
+    // SAFETY: the audio worker creates and uses the policy client in its MTA.
+    let config = unsafe { CoCreateInstance(&policy::POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)? };
+    let console = set_endpoint_role(&config, id, eConsole);
+    let multimedia = set_endpoint_role(&config, id, eMultimedia);
+    console.and(multimedia)
+}
+
 fn peak(meter: Option<&IAudioMeterInformation>) -> f32 {
     // SAFETY: the audio worker calls meters within their owning MTA.
     meter
@@ -582,7 +711,7 @@ fn peak(meter: Option<&IAudioMeterInformation>) -> f32 {
 }
 
 fn take_string(value: PWSTR) -> String {
-    // SAFETY: GetDisplayName returns a NUL-terminated task allocation or a null pointer.
+    // SAFETY: callers pass a NUL-terminated task allocation or a null pointer.
     unsafe {
         let name = if value.is_null() {
             String::new()
@@ -619,6 +748,9 @@ fn process_path(pid: u32) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static AUDIO_SETTINGS: Mutex<()> = Mutex::new(());
 
     #[test]
     fn names_prefer_display_then_description_then_exe_stem() {
@@ -702,18 +834,83 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "switches and restores the real default output when two devices are active"]
+    fn real_default_output_switches_and_restores() -> Result<()> {
+        let _settings = AUDIO_SETTINGS.lock().unwrap();
+        let _apartment = Apartment::start()?;
+        // SAFETY: this test owns the COM apartment and all endpoint interfaces.
+        unsafe {
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+            let start = Instant::now();
+            let devices = active_devices(&enumerator)?;
+            let elapsed = start.elapsed();
+            let count = enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?
+                .GetCount()?;
+            assert_eq!(devices.len(), count as usize);
+            assert!(
+                devices
+                    .iter()
+                    .all(|device| !device.id.0.is_empty() && device.name != "Output device")
+            );
+            println!(
+                "Enumerated {count} active render endpoints with IDs and names in {elapsed:?}"
+            );
+            if devices.len() < 2 {
+                println!("Switch skipped: at least two active render endpoints are required");
+                return Ok(());
+            }
+
+            let default = |role| device_id(&enumerator.GetDefaultAudioEndpoint(eRender, role)?);
+            let roles = [eConsole, eMultimedia];
+            let originals = [default(eConsole)?, default(eMultimedia)?];
+            let communications = default(eCommunications).ok();
+            let target = devices
+                .iter()
+                .find(|device| device.id != originals[0])
+                .unwrap();
+            let config = CoCreateInstance(&policy::POLICY_CONFIG_CLIENT, None, CLSCTX_ALL)?;
+
+            let switched = set_default_device(&target.id);
+            let written = roles.map(default);
+            let written_communications = default(eCommunications).ok();
+            let restores = std::array::from_fn::<_, 2, _>(|i| {
+                set_endpoint_role(&config, &originals[i], roles[i])
+            });
+            for restored in restores {
+                restored?;
+            }
+            assert_eq!(default(eConsole)?, originals[0]);
+            assert_eq!(default(eMultimedia)?, originals[1]);
+            assert_eq!(default(eCommunications).ok(), communications);
+            assert_eq!(written_communications, communications);
+            switched?;
+            for id in written {
+                assert_eq!(id?, target.id);
+            }
+            println!(
+                "Switched console and multimedia to {} and restored both defaults",
+                target.name
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "requires an audio session on the real default output"]
     fn real_default_output_restores_app_volume() -> Result<()> {
+        let _settings = AUDIO_SETTINGS.lock().unwrap();
         let _apartment = Apartment::start()?;
         let mut worker = Worker::new(Live::new(0.0), mpsc::channel().0);
-        let (snapshot, output) = worker.read_output()?;
+        let mut snapshot = Snapshot::default();
+        worker.output = Some(worker.read_output(&mut snapshot)?);
         let app = snapshot
             .apps
             .iter()
             .find(|app| app.key != AppKey::for_process(0, None))
             .expect("play audio in an app on the default device before running this test");
         let channel = Channel::App(app.key.clone());
-        worker.output = Some(output);
         let sessions: Vec<_> = worker
             .output
             .iter()

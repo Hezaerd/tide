@@ -3100,6 +3100,7 @@ dependencies = [
  "rune",
  "rune-kit",
  "windows",
+ "windows-core",
  "winresource",
  "winshell",
 ]
