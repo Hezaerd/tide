@@ -2538,6 +2538,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "rune-kit"
+version = "0.0.1"
+source = "git+https://github.com/anomalyco/rune?rev=4918969f04dce020f63b34e024368a86e5e1857d#4918969f04dce020f63b34e024368a86e5e1857d"
+dependencies = [
+ "icu_normalizer",
+ "rune",
+ "rune-motion",
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "rune-media"
 version = "0.0.1"
 source = "git+https://github.com/anomalyco/rune?rev=4918969f04dce020f63b34e024368a86e5e1857d#4918969f04dce020f63b34e024368a86e5e1857d"
@@ -3078,6 +3089,7 @@ version = "0.1.0"
 dependencies = [
  "image",
  "rune",
+ "rune-kit",
  "windows",
  "windows-registry",
 ]

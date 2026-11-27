@@ -13,7 +13,9 @@ use windows::{
         Foundation::{CloseHandle, SIZE},
         Media::Audio::{Endpoints::*, *},
         System::{Com::*, Threading::*},
-        UI::Shell::{IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY},
+        UI::Shell::{
+            IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, SIIGBF_SCALEUP,
+        },
     },
     core::{Interface, PCWSTR, PWSTR, Result},
 };
@@ -286,7 +288,10 @@ impl Worker {
                     self.revision += 1;
                     self.set_mute(&channel, muted);
                 }
-                Some(Command::Open) => generation += 1,
+                Some(Command::Open) => {
+                    generation += 1;
+                    self.revision = 0;
+                }
                 None => {}
             }
             let now = Instant::now();
@@ -527,9 +532,14 @@ fn process_details(path: &Path) -> ProcessDetails {
     // and read_bitmap consumes the returned HBITMAP.
     let icon = unsafe {
         SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(name.as_ptr()), None)
-            .and_then(|item| item.GetImage(SIZE { cx: size, cy: size }, SIIGBF_ICONONLY))
+            .and_then(|item| {
+                item.GetImage(
+                    SIZE { cx: size, cy: size },
+                    SIIGBF_ICONONLY | SIIGBF_SCALEUP,
+                )
+            })
             .ok()
-            .and_then(|bitmap| icon::read_bitmap(bitmap, size as u32))
+            .and_then(icon::read_bitmap)
     };
     ProcessDetails {
         description: icon::file_description(path),

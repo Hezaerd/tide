@@ -1,5 +1,5 @@
 # /// script
-# dependencies = ["resvg-py"]
+# dependencies = ["resvg-py==0.5.0"]
 # ///
 from pathlib import Path
 

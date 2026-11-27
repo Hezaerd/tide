@@ -10,6 +10,8 @@ use rune::{
     Shape, Tray, Tx, canvas, col, el, row, text, tok::TextStyle,
 };
 
+use rune_kit::{ScrollBar, ScrollBarStyle};
+
 use crate::{
     audio::{AppInfo, AppKey, Channel, Command, Peaks, Snapshot, Update},
     theme::{self, Theme},
@@ -93,6 +95,7 @@ impl State {
             && self.send(Command::Open)
         {
             self.generation += 1;
+            self.revision = 0;
             self.panel = Panel::Opening(placement);
         }
     }
@@ -112,7 +115,7 @@ impl State {
                 self.pixels.entry(app.key.clone()).or_insert_with(|| {
                     [icon.as_ref().clone(), icon.gray()].map(|image| {
                         let pixels = Pixels::new();
-                        pixels.set(image.size, image.size, image.bytes);
+                        pixels.set(image.width, image.height, image.bytes);
                         pixels
                     })
                 });
@@ -202,7 +205,7 @@ impl State {
             Change::Set(_) | Change::Step(_) => {
                 let value = match change {
                     Change::Set(value) => value,
-                    Change::Step(amount) => (*volume * 100.0).round().mul_add(0.01, amount),
+                    Change::Step(amount) => (*volume * 100.0).round() / 100.0 + amount,
                     Change::Mute => unreachable!(),
                 };
                 let value = (value.clamp(0.0, 1.0) * 100.0).round() / 100.0;
@@ -251,11 +254,7 @@ fn keyboard_change(key: &Key) -> Option<Change> {
 }
 
 fn label(value: impl Into<String>, style: TextStyle, color: Color) -> El {
-    text(value.into())
-        .font(style)
-        .color(color)
-        .truncate()
-        .a11y_hidden()
+    text(value.into()).font(style).color(color).truncate()
 }
 
 pub fn view(state: &State, cx: &mut Cx<State>) -> El {
@@ -335,6 +334,11 @@ pub fn view(state: &State, cx: &mut Cx<State>) -> El {
             .scroll(ScrollSpec::default())
             .scroll_edge_fade(12.0)
             .child(content)
+            .scroll_bar_styled(
+                ScrollBarStyle::native(t.faint, t.sub)
+                    .inside()
+                    .always_visible(),
+            )
     } else {
         col().key("scroll").w_full().h(list_height).child(content)
     };
@@ -439,11 +443,13 @@ impl MixerRow<'_> {
             .on_set_value(move |s: &mut State, value, _| {
                 s.change(&setter, Change::Set(value as f32 / 100.0))
             })
-            .on_key(move |s: &mut State, event, _| {
+            .on_key(move |s: &mut State, event, tx| {
                 let Some(change) = keyboard_change(&event.key) else {
                     return false;
                 };
-                s.change(&keyboard, change);
+                if !matches!(change, Change::Mute) || !tx.key_repeat() {
+                    s.change(&keyboard, change);
+                }
                 true
             })
             .on_wheel(move |s: &mut State, event, _| {
@@ -467,6 +473,7 @@ impl MixerRow<'_> {
                     .key("value")
                     .size(36.0, 16.0)
                     .self_end()
+                    .offset(0.0, 5.0)
                     .justify_end()
                     .child(label(volume_text, value_style, value_color).key("value-text")),
             )
@@ -474,7 +481,10 @@ impl MixerRow<'_> {
 
     fn icon(&self, t: Theme, row_key: String) -> El {
         let tile = match (self.pixels, &self.channel) {
-            (Some(pixels), _) => el().key("mark").size(28.0, 28.0).pixels(pixels),
+            (Some(pixels), _) => el()
+                .key("mark")
+                .size(28.0, 28.0)
+                .pixels_fit(pixels, rune::SurfaceFit::Fit),
             (None, Channel::Master) => canvas(
                 Shape::new()
                     .view_box(16.0, 16.0)
@@ -499,7 +509,11 @@ impl MixerRow<'_> {
                 label(letter, TextStyle::new(12.5, 700.0).lh(16.0), Color::WHITE).key("mark")
             }
         };
-        let fallback = if self.muted { t.faint } else { self.accent };
+        let fallback = if self.muted {
+            t.faint.alpha(0.4)
+        } else {
+            self.accent
+        };
         let channel = self.channel.clone();
         let mut button = el()
             .key("mute")

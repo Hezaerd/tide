@@ -3,8 +3,8 @@ use windows::{
     Win32::{
         Foundation::HWND,
         Graphics::Gdi::{
-            BI_RGB, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC, GetDIBits,
-            HBITMAP, HGDIOBJ, ReleaseDC,
+            BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC,
+            GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
         },
         Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
     },
@@ -13,7 +13,8 @@ use windows::{
 
 #[derive(Clone)]
 pub struct Rgba {
-    pub size: u32,
+    pub width: u32,
+    pub height: u32,
     pub bytes: Vec<u8>,
 }
 
@@ -50,12 +51,16 @@ pub fn file_description(path: &Path) -> Option<String> {
         if !VerQueryValueW(block, w!(r"\VarFileInfo\Translation"), &mut value, &mut len).as_bool() {
             return None;
         }
+        if value.is_null() || len < 4 {
+            return None;
+        }
         let languages =
             std::slice::from_raw_parts(value.cast::<[u16; 2]>(), len as usize / 4).to_vec();
         for [language, codepage] in languages {
             let query = format!(r"\StringFileInfo\{language:04x}{codepage:04x}\FileDescription");
             let query: Vec<_> = query.encode_utf16().chain([0]).collect();
             if VerQueryValueW(block, PCWSTR(query.as_ptr()), &mut value, &mut len).as_bool()
+                && !value.is_null()
                 && len > 0
             {
                 let units = std::slice::from_raw_parts(value.cast::<u16>(), len as usize);
@@ -70,13 +75,34 @@ pub fn file_description(path: &Path) -> Option<String> {
     }
 }
 
-pub fn read_bitmap(bitmap: HBITMAP, size: u32) -> Option<Rgba> {
-    let mut bytes = vec![0u8; (size * size * 4) as usize];
+pub fn read_bitmap(bitmap: HBITMAP) -> Option<Rgba> {
+    let object = HGDIOBJ(bitmap.0);
+    let mut meta = BITMAP::default();
+    // SAFETY: GetImage transferred this bitmap to us. GetObjectW fills a writable BITMAP.
+    let size = unsafe {
+        GetObjectW(
+            object,
+            std::mem::size_of::<BITMAP>() as i32,
+            Some((&mut meta as *mut BITMAP).cast()),
+        )
+    };
+    // SAFETY: The bitmap came from GetImage, so it is valid until it is freed below.
+    unsafe {
+        let image = (size != 0 && meta.bmWidth > 0 && meta.bmHeight > 0)
+            .then(|| bitmap_rgba(bitmap, meta.bmWidth, meta.bmHeight))
+            .flatten();
+        let _ = DeleteObject(object);
+        image
+    }
+}
+
+fn bitmap_rgba(bitmap: HBITMAP, width: i32, height: i32) -> Option<Rgba> {
+    let mut bytes = vec![0u8; width as usize * height as usize * 4];
     let mut info = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: size as i32,
-            biHeight: -(size as i32),
+            biWidth: width,
+            biHeight: -height,
             biPlanes: 1,
             biBitCount: 32,
             biCompression: BI_RGB.0,
@@ -84,29 +110,26 @@ pub fn read_bitmap(bitmap: HBITMAP, size: u32) -> Option<Rgba> {
         },
         ..Default::default()
     };
-    // SAFETY: bitmap is a shell-owned allocation transferred to us. The DIB buffer
-    // holds size rows of 32-bit pixels, and the DC and bitmap are released here.
+    // SAFETY: The bitmap is valid and unselected. The buffer holds height rows of width
+    // 32-bit pixels. The screen DC is released on this thread.
     let rows = unsafe {
         let dc = GetDC(None);
-        let rows = if dc.is_invalid() {
-            0
-        } else {
-            let rows = GetDIBits(
-                dc,
-                bitmap,
-                0,
-                size,
-                Some(bytes.as_mut_ptr().cast()),
-                &mut info,
-                DIB_RGB_COLORS,
-            );
-            ReleaseDC(Some(HWND::default()), dc);
-            rows
-        };
-        let _ = DeleteObject(HGDIOBJ(bitmap.0));
+        if dc.is_invalid() {
+            return None;
+        }
+        let rows = GetDIBits(
+            dc,
+            bitmap,
+            0,
+            height as u32,
+            Some(bytes.as_mut_ptr().cast()),
+            &mut info,
+            DIB_RGB_COLORS,
+        );
+        ReleaseDC(Some(HWND::default()), dc);
         rows
     };
-    if rows != size as i32 || bytes.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0) {
+    if rows != height || bytes.as_chunks::<4>().0.iter().all(|pixel| pixel[3] == 0) {
         return None;
     }
     for pixel in bytes.as_chunks_mut::<4>().0 {
@@ -118,7 +141,11 @@ pub fn read_bitmap(bitmap: HBITMAP, size: u32) -> Option<Rgba> {
             }
         }
     }
-    Some(Rgba { size, bytes })
+    Some(Rgba {
+        width: width as u32,
+        height: height as u32,
+        bytes,
+    })
 }
 
 pub fn accent(icon: &Rgba) -> Option<[u8; 3]> {
