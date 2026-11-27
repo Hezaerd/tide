@@ -4,64 +4,43 @@ use std::{
 };
 
 use rune::{AppHandle, Tray, TrayError, TrayEvent, TrayIcon, TrayItem, TraySpec};
-use windows::{
-    Win32::{
-        Foundation::{POINT, RECT},
-        Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
-        UI::{
-            HiDpi::{GetDpiForMonitor, GetDpiForSystem, GetDpiForWindow, MDT_EFFECTIVE_DPI},
-            WindowsAndMessaging::{FindWindowW, GetCursorPos},
-        },
+use windows::Win32::{
+    Foundation::{POINT, RECT},
+    Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint},
+    UI::{
+        HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI},
+        WindowsAndMessaging::GetCursorPos,
     },
-    core::{PCWSTR, w},
 };
+use winshell::{Autostart, Mark, Taskbar};
 
-use crate::{autostart, ui::State};
+use crate::ui::State;
 
-const MARKS: [(u32, &[u8], &[u8]); 4] = [
-    (
-        16,
-        include_bytes!("../assets/wave-black-16.png"),
-        include_bytes!("../assets/wave-white-16.png"),
-    ),
-    (
-        24,
-        include_bytes!("../assets/wave-black-24.png"),
-        include_bytes!("../assets/wave-white-24.png"),
-    ),
-    (
-        32,
-        include_bytes!("../assets/wave-black-32.png"),
-        include_bytes!("../assets/wave-white-32.png"),
-    ),
-    (
-        64,
-        include_bytes!("../assets/wave-black-64.png"),
-        include_bytes!("../assets/wave-white-64.png"),
-    ),
+const AUTOSTART: Autostart = Autostart::new("Tide");
+const MARKS: &[Mark] = &[
+    Mark {
+        px: 16,
+        black: include_bytes!("../assets/wave-black-16.png"),
+        white: include_bytes!("../assets/wave-white-16.png"),
+    },
+    Mark {
+        px: 24,
+        black: include_bytes!("../assets/wave-black-24.png"),
+        white: include_bytes!("../assets/wave-white-24.png"),
+    },
+    Mark {
+        px: 32,
+        black: include_bytes!("../assets/wave-black-32.png"),
+        white: include_bytes!("../assets/wave-white-32.png"),
+    },
+    Mark {
+        px: 64,
+        black: include_bytes!("../assets/wave-black-64.png"),
+        white: include_bytes!("../assets/wave-white-64.png"),
+    },
 ];
 
-fn appearance() -> (bool, usize) {
-    // SAFETY: this reads a system window's DPI without retaining its handle.
-    let dpi = unsafe {
-        FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null())
-            .map_or_else(|_| GetDpiForSystem(), |taskbar| GetDpiForWindow(taskbar))
-    };
-    let light = windows_registry::CURRENT_USER
-        .open(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
-        .and_then(|key| key.get_u32("SystemUsesLightTheme"))
-        .is_ok_and(|value| value != 0);
-    let size = (16 * dpi).div_ceil(96);
-    let index = MARKS
-        .iter()
-        .position(|(width, ..)| *width >= size)
-        .unwrap_or(MARKS.len() - 1);
-    (light, index)
-}
-
-fn mark((light, index): (bool, usize)) -> TrayIcon {
-    let (size, black, white) = MARKS[index];
-    let bytes = if light { black } else { white };
+fn mark((size, bytes): (u32, &[u8])) -> TrayIcon {
     let image = image::load_from_memory_with_format(bytes, image::ImageFormat::Png)
         .expect("embedded Tide tray mark is a PNG")
         .into_rgba8();
@@ -70,13 +49,13 @@ fn mark((light, index): (bool, usize)) -> TrayIcon {
 
 fn menu() -> Vec<TrayItem> {
     vec![
-        TrayItem::check("autostart", "Start with Windows", autostart::enabled()),
+        TrayItem::check("autostart", "Start with Windows", AUTOSTART.enabled()),
         TrayItem::action("quit", "Quit"),
     ]
 }
 
 pub fn install(handle: AppHandle<State>) -> Result<Arc<Tray>, TrayError> {
-    let mut current = appearance();
+    let mut current = Taskbar::current().mark(MARKS);
     let slot = Arc::new(OnceLock::<std::sync::Weak<Tray>>::new());
     let callback_tray = slot.clone();
     let tray = Arc::new(Tray::new(
@@ -90,7 +69,7 @@ pub fn install(handle: AppHandle<State>) -> Result<Arc<Tray>, TrayError> {
                 handle.update(move |s, tx| s.toggle(placement, time, tx));
             }
             TrayEvent::Menu(id) if id == "autostart" => {
-                if let Err(error) = autostart::toggle() {
+                if let Err(error) = AUTOSTART.set(!AUTOSTART.enabled()) {
                     eprintln!("Tide could not update Start with Windows: {error}");
                 }
                 if let Some(tray) = callback_tray.get().and_then(std::sync::Weak::upgrade) {
@@ -107,7 +86,7 @@ pub fn install(handle: AppHandle<State>) -> Result<Arc<Tray>, TrayError> {
         loop {
             std::thread::sleep(Duration::from_secs(2));
             let Some(tray) = refresh.upgrade() else { break };
-            let next = appearance();
+            let next = Taskbar::current().mark(MARKS);
             if next != current && tray.set_icon(mark(next)).is_ok() {
                 current = next;
             }
