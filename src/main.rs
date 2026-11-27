@@ -53,7 +53,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let (command, peak) = audio::start(move |update| {
             inbox.update_if(move |state, tx| state.apply(update, tx));
         })?;
-        let tray = tray::install(handle.clone())?;
+        let (_taskbar_watcher, tray) = tray::install(handle.clone())?;
         let weak_tray = std::sync::Arc::downgrade(&tray);
         app.init(move || State::connected(command, peak, handle, weak_tray))
             .try_run()?;
