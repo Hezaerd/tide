@@ -456,7 +456,7 @@ impl MixerRow<'_> {
                 if event.dy == 0.0 || event.precise || event.touch {
                     return false;
                 }
-                s.change(&wheel, Change::Step(-event.dy.signum() * 0.02));
+                s.change(&wheel, Change::Step(event.dy.signum() * 0.02));
                 true
             })
             .child(self.icon(t, key.clone()))
