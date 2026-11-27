@@ -6,7 +6,7 @@ Tide is a Windows tray volume mixer built with Rune. Clicking the tray icon open
 
 - `src/audio.rs` is the only module that calls WASAPI. It runs on its own COM thread, takes `Command`s over a channel, and publishes `Snapshot`s to the UI.
 - `src/ui.rs` holds the pop-up state and view. `src/tray.rs` owns the tray icon and its menu. `src/theme.rs` holds the light and dark tokens. `src/icon.rs` extracts app icons and accent colours. `winshell` manages "Start with Windows" and selects the taskbar mark for `src/tray.rs`.
-- `assets/` holds the tray marks. Regenerate the PNGs with `scripts/generate-wave.py` rather than editing them by hand.
+- `assets/` holds the tray marks and the app icon. Use `scripts/generate-wave.py` to regenerate the tray PNGs and app ICO.
 - `installer/tide.iss` defines the per-user Windows installer.
 - Rune is pinned to one git rev in `Cargo.toml`, together with the `[patch.crates-io]` block. Change all of them together.
 

@@ -9,6 +9,7 @@ PrivilegesRequired=lowest
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 UninstallDisplayIcon={app}\tide.exe
+SetupIconFile=..\assets\tide.ico
 WizardStyle=modern
 DisableProgramGroupPage=yes
 OutputDir=..\dist
