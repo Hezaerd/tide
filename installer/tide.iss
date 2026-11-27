@@ -25,6 +25,7 @@ Name: "autostart"; Description: "Start Tide when I sign in"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "Tide"; ValueData: """{app}\tide.exe"""; Tasks: autostart
+Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"; ValueType: none; ValueName: "Tide"; Flags: deletevalue; Tasks: autostart
 
 [Run]
 Filename: "{app}\tide.exe"; Description: "Launch Tide"; Flags: postinstall nowait skipifsilent
@@ -44,5 +45,8 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if CurUninstallStep = usUninstall then
+  begin
     RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Run', 'Tide');
+    RegDeleteValue(HKCU, 'Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run', 'Tide');
+  end;
 end;
