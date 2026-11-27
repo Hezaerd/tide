@@ -7,7 +7,7 @@ mod tray;
 mod ui;
 
 use rune::{App, AppSpec, WindowOptions, WindowsWindowOptions};
-use ui::State;
+use ui::{State, ToggleSource};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let headless = cfg!(debug_assertions)
@@ -41,6 +41,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .undecorated_shadow(true),
         )
         .fit_content_height()
+        .global_shortcut("super+alt+v", |state, tx| {
+            state.toggle(ToggleSource::Hotkey, tx)
+        })
         .on_focus(State::focus_changed)
         .on_close(State::closed);
 

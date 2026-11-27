@@ -14,7 +14,7 @@ use windows::Win32::{
 };
 use winshell::{Autostart, Mark, Taskbar};
 
-use crate::ui::State;
+use crate::ui::{State, ToggleSource};
 
 mod taskbar;
 
@@ -64,13 +64,13 @@ pub fn install(handle: AppHandle<State>) -> Result<(Option<TaskbarWatcher>, Arc<
     let callback_tray = slot.clone();
     let tray = Arc::new(Tray::new(
         TraySpec::new("com.hezaerd.tide", "Tide", mark(current))
-            .tooltip("Tide")
+            .tooltip("Tide (Win+Alt+V)")
             .menu(menu()),
         move |event| match event {
             TrayEvent::Activate { .. } => {
                 let time = Instant::now();
-                let placement = cursor_monitor();
-                handle.update(move |s, tx| s.toggle(placement, time, tx));
+                let placement = monitor_at(cursor());
+                handle.update(move |s, tx| s.toggle(ToggleSource::Tray { placement, time }, tx));
             }
             TrayEvent::Menu(id) if id == "autostart" => {
                 if let Err(error) = AUTOSTART.set(!AUTOSTART.enabled()) {
@@ -110,7 +110,7 @@ pub struct Placement {
 }
 
 impl Placement {
-    fn new(monitor: RECT, work: RECT, cursor: POINT, scale: f32) -> Self {
+    fn new(monitor: RECT, work: RECT, point: POINT, scale: f32) -> Self {
         let insets = [
             monitor.bottom - work.bottom,
             monitor.right - work.right,
@@ -123,12 +123,12 @@ impl Placement {
         let right = match edge {
             1 => true,
             3 => false,
-            _ => cursor.x >= work.left + (work.right - work.left) / 2,
+            _ => point.x >= work.left + (work.right - work.left) / 2,
         };
         let bottom = match edge {
             0 => true,
             2 => false,
-            _ => cursor.y >= work.top + (work.bottom - work.top) / 2,
+            _ => point.y >= work.top + (work.bottom - work.top) / 2,
         };
         Self {
             work,
@@ -172,11 +172,23 @@ pub fn pointer_on_icon(tray: &Tray) -> Option<bool> {
     Some(point.x >= x && point.x < x + width && point.y >= y && point.y < y + height)
 }
 
-fn cursor_monitor() -> Option<Placement> {
-    let cursor = cursor();
-    // SAFETY: this monitor is selected by a physical cursor point and all out pointers are valid.
+fn rect_center([x, y, width, height]: [i32; 4]) -> POINT {
+    POINT {
+        x: x + width / 2,
+        y: y + height / 2,
+    }
+}
+
+pub fn hotkey_placement(tray: Option<&Tray>) -> Option<Placement> {
+    tray.and_then(Tray::rect)
+        .and_then(|rect| monitor_at(rect_center(rect)))
+        .or_else(|| monitor_at(cursor()))
+}
+
+fn monitor_at(point: POINT) -> Option<Placement> {
+    // SAFETY: all out pointers are valid for the calls.
     unsafe {
-        let monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        let monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
         let mut info = MONITORINFO {
             cbSize: std::mem::size_of::<MONITORINFO>() as u32,
             ..Default::default()
@@ -189,7 +201,7 @@ fn cursor_monitor() -> Option<Placement> {
         Some(Placement::new(
             info.rcMonitor,
             info.rcWork,
-            cursor,
+            point,
             x.max(96) as f32 / 96.0,
         ))
     }
@@ -198,6 +210,11 @@ fn cursor_monitor() -> Option<Placement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn centers_the_tray_icon_in_physical_screen_coordinates() {
+        assert_eq!(rect_center([-104, -44, 24, 32]), POINT { x: -92, y: -28 });
+    }
 
     #[test]
     fn anchors_inside_the_work_area_at_the_taskbar_edge_and_cursor_corner() {

@@ -24,6 +24,7 @@ const ROW_HEIGHT: f32 = 42.0;
 const TRACK_WIDTH: f32 = 204.0;
 const TRACK_HEIGHT: f32 = 6.0;
 const DEBOUNCE: Duration = Duration::from_millis(300);
+const MASTER_ROW_KEY: &str = "master";
 const WHEEL_VOLUME_STEP: f32 = 0.02;
 const SCROLL_POINTS_PER_STEP: f32 = 16.0;
 const UNPHASED_SCROLL_IDLE: Duration = Duration::from_millis(100);
@@ -38,8 +39,17 @@ struct VolumeScroll {
 enum Panel {
     #[default]
     Closed,
-    Opening(Placement),
+    Opening(Placement, ToggleSource),
     Open(Placement),
+}
+
+#[derive(Clone, Copy)]
+pub enum ToggleSource {
+    Tray {
+        placement: Option<Placement>,
+        time: Instant,
+    },
+    Hotkey,
 }
 
 pub struct State {
@@ -98,16 +108,28 @@ impl State {
             .is_some_and(|tx| tx.send(command).is_ok())
     }
 
-    pub fn toggle(&mut self, placement: Option<Placement>, time: Instant, tx: &mut Tx) {
+    pub fn toggle(&mut self, source: ToggleSource, tx: &mut Tx) {
         if !matches!(self.panel, Panel::Closed) {
             self.close(tx);
-        } else if !same_click(self.lost_focus_at.take(), time)
-            && let Some(placement) = placement
+            return;
+        }
+
+        let lost_focus_at = self.lost_focus_at.take();
+        let placement = match source {
+            ToggleSource::Tray { placement, time } => {
+                if same_click(lost_focus_at, time) {
+                    return;
+                }
+                placement
+            }
+            ToggleSource::Hotkey => tray::hotkey_placement(self.tray.upgrade().as_deref()),
+        };
+        if let Some(placement) = placement
             && self.send(Command::Open)
         {
             self.generation += 1;
             self.revision = 0;
-            self.panel = Panel::Opening(placement);
+            self.panel = Panel::Opening(placement, source);
         }
     }
 
@@ -117,8 +139,8 @@ impl State {
         }
         let (placement, opening) = match self.panel {
             Panel::Closed => return false,
-            Panel::Opening(placement) => (placement, true),
-            Panel::Open(placement) => (placement, false),
+            Panel::Opening(placement, source) => (placement, Some(source)),
+            Panel::Open(placement) => (placement, None),
         };
         let count_changed = self.snapshot.apps.len() != update.snapshot.apps.len();
         for app in &update.snapshot.apps {
@@ -135,13 +157,16 @@ impl State {
         self.snapshot = update.snapshot;
         self.peaks = update.peaks;
         if let Some(window) = &self.window {
-            if opening || count_changed {
+            if opening.is_some() || count_changed {
                 let height = panel_height(self.snapshot.apps.len(), placement.max_height());
                 window.set_position(placement.position(WIDTH, height));
                 tx.resize_window_instant((WIDTH, height));
             }
-            if opening {
+            if let Some(source) = opening {
                 self.panel = Panel::Open(placement);
+                if matches!(source, ToggleSource::Hotkey) {
+                    tx.focus_when_shown(MASTER_ROW_KEY, true);
+                }
                 window.open();
             }
         }
@@ -186,7 +211,7 @@ impl State {
         }
         match self.panel {
             Panel::Closed => FRAME_HEIGHT,
-            Panel::Opening(placement) | Panel::Open(placement) => placement.max_height(),
+            Panel::Opening(placement, _) | Panel::Open(placement) => placement.max_height(),
         }
     }
 
@@ -438,7 +463,7 @@ struct MixerRow<'a> {
 impl MixerRow<'_> {
     fn key(&self) -> String {
         match &self.channel {
-            Channel::Master => "master".into(),
+            Channel::Master => MASTER_ROW_KEY.into(),
             Channel::App(key) => format!("app:{}", key.as_str()),
         }
     }

@@ -4,6 +4,7 @@ Tide is a small volume mixer for Windows. Click its tray icon to set the volume 
 
 <img src="docs/tide.png" alt="Tide's mixer panel in dark mode" width="320">
 
+- Press **Win+Alt+V** to open or close the mixer.
 - One slider per app, plus master volume for the current output device.
 - A live level meter in each slider.
 - Click an app's icon to mute it. Scroll over a row to adjust it.
