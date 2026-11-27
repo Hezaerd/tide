@@ -10,14 +10,11 @@ use std::{
 use windows::{
     Win32::{
         Devices::FunctionDiscovery::PKEY_Device_FriendlyName,
-        Foundation::{CloseHandle, SIZE},
+        Foundation::CloseHandle,
         Media::Audio::{Endpoints::*, *},
         System::{Com::*, Threading::*},
-        UI::Shell::{
-            IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, SIIGBF_SCALEUP,
-        },
     },
-    core::{Interface, PCWSTR, PWSTR, Result},
+    core::{Interface, PWSTR, Result},
 };
 
 const REFRESH: Duration = Duration::from_secs(1);
@@ -47,6 +44,7 @@ pub enum Channel {
     App(AppKey),
 }
 
+#[derive(Clone)]
 pub struct AppInfo {
     pub key: AppKey,
     pub name: String,
@@ -57,11 +55,25 @@ pub struct AppInfo {
     pub streams: usize,
 }
 
+#[derive(Clone)]
 pub struct Snapshot {
     pub device: String,
     pub master_volume: f32,
     pub master_muted: bool,
     pub apps: Vec<AppInfo>,
+}
+
+impl Snapshot {
+    pub fn channel_mut(&mut self, channel: &Channel) -> Option<(&mut f32, &mut bool)> {
+        match channel {
+            Channel::Master => Some((&mut self.master_volume, &mut self.master_muted)),
+            Channel::App(key) => self
+                .apps
+                .iter_mut()
+                .find(|app| &app.key == key)
+                .map(|app| (&mut app.volume, &mut app.muted)),
+        }
+    }
 }
 
 impl Default for Snapshot {
@@ -91,10 +103,42 @@ pub enum Command {
     SetMute(Channel, bool),
 }
 
+enum Message {
+    Command(Command),
+    IconLoaded(AppKey, AppIcon),
+}
+
+pub struct CommandSender(Arc<mpsc::Sender<Message>>);
+
+impl CommandSender {
+    pub fn send(&self, command: Command) -> bool {
+        self.0.send(Message::Command(command)).is_ok()
+    }
+}
+
 pub fn start(
     mut publish: impl FnMut(Update) + Send + 'static,
-) -> std::io::Result<(mpsc::Sender<Command>, Live<f32>)> {
+) -> std::io::Result<(CommandSender, Live<f32>)> {
     let (tx, rx) = mpsc::channel();
+    let tx = Arc::new(tx);
+    let results = Arc::downgrade(&tx);
+    let (icon_tx, icon_rx) = mpsc::channel::<(AppKey, PathBuf)>();
+    std::thread::Builder::new()
+        .name("tide-icons".into())
+        .spawn(move || {
+            let Ok(_apartment) = Apartment::start() else {
+                return;
+            };
+            for (key, path) in icon_rx {
+                let icon = AppIcon::load(&path);
+                let Some(results) = results.upgrade() else {
+                    break;
+                };
+                if results.send(Message::IconLoaded(key, icon)).is_err() {
+                    break;
+                }
+            }
+        })?;
     let master_peak = Live::new(0.0);
     let peak = master_peak.clone();
     std::thread::Builder::new()
@@ -103,7 +147,7 @@ pub fn start(
             let Ok(_apartment) = Apartment::start() else {
                 let mut generation = 0;
                 while let Ok(command) = rx.recv() {
-                    if matches!(command, Command::Open) {
+                    if matches!(command, Message::Command(Command::Open)) {
                         generation += 1;
                         publish(Update {
                             snapshot: Snapshot::default(),
@@ -115,9 +159,9 @@ pub fn start(
                 }
                 return;
             };
-            Worker::new(peak).run(rx, publish);
+            Worker::new(peak, icon_tx).run(rx, publish);
         })?;
-    Ok((tx, master_peak))
+    Ok((CommandSender(tx), master_peak))
 }
 
 struct Apartment;
@@ -228,10 +272,32 @@ struct Output {
 }
 
 #[derive(Default)]
+struct AppIcon {
+    image: Option<Arc<Rgba>>,
+    accent: Option<[u8; 3]>,
+}
+
+impl AppIcon {
+    fn load(path: &Path) -> Self {
+        let image = icon::app_icon(path);
+        Self {
+            accent: image.as_ref().and_then(icon::accent),
+            image: image.map(Arc::new),
+        }
+    }
+
+    fn apply(&self, app: &mut AppInfo) {
+        app.icon = self.image.clone();
+        app.accent = self
+            .accent
+            .unwrap_or_else(|| icon::fallback_accent(&app.name));
+    }
+}
+
+#[derive(Default)]
 struct ProcessDetails {
     description: Option<String>,
-    icon: Option<Arc<Rgba>>,
-    accent: Option<[u8; 3]>,
+    icon: AppIcon,
 }
 
 struct Worker {
@@ -239,28 +305,31 @@ struct Worker {
     output: Option<Output>,
     order: AppOrder,
     details: HashMap<AppKey, ProcessDetails>,
+    icons: mpsc::Sender<(AppKey, PathBuf)>,
     peaks: Peaks,
     master_peak: Live<f32>,
     revision: u64,
 }
 
 impl Worker {
-    fn new(master_peak: Live<f32>) -> Self {
+    fn new(master_peak: Live<f32>, icons: mpsc::Sender<(AppKey, PathBuf)>) -> Self {
         Self {
             enumerator: None,
             output: None,
             order: AppOrder::default(),
             details: HashMap::new(),
+            icons,
             peaks: HashMap::new(),
             master_peak,
             revision: 0,
         }
     }
 
-    fn run(&mut self, rx: mpsc::Receiver<Command>, mut publish: impl FnMut(Update)) {
+    fn run(&mut self, rx: mpsc::Receiver<Message>, mut publish: impl FnMut(Update)) {
         let mut next_tick: Option<Instant> = None;
         let mut refresh_at = Instant::now();
         let mut generation = 0;
+        let mut snapshot = Snapshot::default();
         loop {
             let command = match next_tick {
                 Some(tick) => match rx.recv_timeout(tick - Instant::now()) {
@@ -273,48 +342,67 @@ impl Worker {
                     Err(_) => break,
                 },
             };
-            let opening = matches!(command, Some(Command::Open));
+            let opening = matches!(command, Some(Message::Command(Command::Open)));
             match command {
-                Some(Command::Close) => {
+                Some(Message::Command(Command::Close)) => {
                     next_tick = None;
                     self.output = None;
+                    snapshot = Snapshot::default();
                     continue;
                 }
-                Some(Command::SetVolume(channel, volume)) => {
+                Some(Message::Command(Command::SetVolume(channel, volume))) => {
                     self.revision += 1;
                     self.set_volume(&channel, volume);
+                    if let Some((current, _)) = snapshot.channel_mut(&channel) {
+                        *current = volume;
+                    }
                 }
-                Some(Command::SetMute(channel, muted)) => {
+                Some(Message::Command(Command::SetMute(channel, muted))) => {
                     self.revision += 1;
                     self.set_mute(&channel, muted);
+                    if let Some((_, current)) = snapshot.channel_mut(&channel) {
+                        *current = muted;
+                    }
                 }
-                Some(Command::Open) => {
+                Some(Message::Command(Command::Open)) => {
                     generation += 1;
                     self.revision = 0;
+                }
+                Some(Message::IconLoaded(key, icon)) => {
+                    let cached = &mut self.details.get_mut(&key).unwrap().icon;
+                    *cached = icon;
+                    if let Some(app) = snapshot.apps.iter_mut().find(|app| app.key == key) {
+                        cached.apply(app);
+                        publish(self.update(&snapshot, generation));
+                    }
                 }
                 None => {}
             }
             let now = Instant::now();
             if opening || next_tick.is_some() && now >= refresh_at {
-                let snapshot = self.refresh();
+                snapshot = self.refresh();
                 self.poll_peaks();
-                let peaks = snapshot
-                    .apps
-                    .iter()
-                    .map(|app| (app.key.clone(), self.peaks[&app.key].clone()))
-                    .collect();
-                publish(Update {
-                    snapshot,
-                    peaks,
-                    generation,
-                    revision: self.revision,
-                });
+                publish(self.update(&snapshot, generation));
                 refresh_at = Instant::now() + REFRESH;
                 next_tick = Some(Instant::now() + PEAK_INTERVAL);
             } else if next_tick.is_some_and(|tick| now >= tick) {
                 self.poll_peaks();
                 next_tick = Some(now + PEAK_INTERVAL);
             }
+        }
+    }
+
+    fn update(&self, snapshot: &Snapshot, generation: u64) -> Update {
+        let peaks = snapshot
+            .apps
+            .iter()
+            .map(|app| (app.key.clone(), self.peaks[&app.key].clone()))
+            .collect();
+        Update {
+            snapshot: snapshot.clone(),
+            peaks,
+            generation,
+            revision: self.revision,
         }
     }
 
@@ -386,10 +474,16 @@ impl Worker {
                     .or_insert_with(|| process_path(pid))
                     .as_deref();
                 let key = AppKey::for_process(pid, path);
-                let details = self
-                    .details
-                    .entry(key.clone())
-                    .or_insert_with(|| path.map_or_else(ProcessDetails::default, process_details));
+                let details = self.details.entry(key.clone()).or_insert_with(|| {
+                    let Some(path) = path else {
+                        return ProcessDetails::default();
+                    };
+                    let _ = self.icons.send((key.clone(), path.to_owned()));
+                    ProcessDetails {
+                        description: icon::file_description(path),
+                        icon: AppIcon::default(),
+                    }
+                });
                 let display = control
                     .GetDisplayName()
                     .map(take_string)
@@ -409,10 +503,7 @@ impl Worker {
             }
             let mut apps = self.order.group(rows);
             for app in &mut apps {
-                app.icon = self.details[&app.key].icon.clone();
-                app.accent = self.details[&app.key]
-                    .accent
-                    .unwrap_or_else(|| icon::fallback_accent(&app.name));
+                self.details[&app.key].icon.apply(app);
                 self.peaks
                     .entry(app.key.clone())
                     .or_insert_with(|| Live::new(0.0));
@@ -525,29 +616,6 @@ fn process_path(pid: u32) -> Option<PathBuf> {
     Some(std::ffi::OsString::from_wide(&buffer[..len as usize]).into())
 }
 
-fn process_details(path: &Path) -> ProcessDetails {
-    let name = icon::wide(path);
-    let size = 56;
-    // SAFETY: this runs inside the audio MTA. The NUL-terminated path lives through the call
-    // and read_bitmap consumes the returned HBITMAP.
-    let icon = unsafe {
-        SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(name.as_ptr()), None)
-            .and_then(|item| {
-                item.GetImage(
-                    SIZE { cx: size, cy: size },
-                    SIIGBF_ICONONLY | SIIGBF_SCALEUP,
-                )
-            })
-            .ok()
-            .and_then(icon::read_bitmap)
-    };
-    ProcessDetails {
-        description: icon::file_description(path),
-        accent: icon.as_ref().and_then(icon::accent),
-        icon: icon.map(Arc::new),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,10 +674,38 @@ mod tests {
     }
 
     #[test]
+    fn a_loaded_icon_replaces_the_placeholder_without_changing_audio_state() {
+        let mut apps =
+            AppOrder::default().group([row(7, "Player", SessionState::Active, 0.6, true)]);
+        let app = &mut apps[0];
+        AppIcon::default().apply(app);
+        assert!(app.icon.is_none());
+        assert_eq!(app.accent, icon::fallback_accent("Player"));
+
+        let image = Arc::new(Rgba {
+            width: 1,
+            height: 1,
+            bytes: vec![10, 20, 30, 255],
+        });
+        AppIcon {
+            image: Some(Arc::clone(&image)),
+            accent: Some([10, 20, 30]),
+        }
+        .apply(app);
+
+        assert!(Arc::ptr_eq(app.icon.as_ref().unwrap(), &image));
+        assert_eq!(app.accent, [10, 20, 30]);
+        assert_eq!(app.name, "Player");
+        assert_eq!(app.volume, 0.6);
+        assert!(app.muted);
+        assert_eq!(app.streams, 1);
+    }
+
+    #[test]
     #[ignore = "requires an audio session on the real default output"]
     fn real_default_output_restores_app_volume() -> Result<()> {
         let _apartment = Apartment::start()?;
-        let mut worker = Worker::new(Live::new(0.0));
+        let mut worker = Worker::new(Live::new(0.0), mpsc::channel().0);
         let (snapshot, output) = worker.read_output()?;
         let app = snapshot
             .apps

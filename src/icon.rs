@@ -1,12 +1,15 @@
 use std::{ffi::c_void, os::windows::ffi::OsStrExt, path::Path, ptr};
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, SIZE},
         Graphics::Gdi::{
             BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, DIB_RGB_COLORS, DeleteObject, GetDC,
             GetDIBits, GetObjectW, HBITMAP, HGDIOBJ, ReleaseDC,
         },
         Storage::FileSystem::{GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW},
+        UI::Shell::{
+            IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_ICONONLY, SIIGBF_SCALEUP,
+        },
     },
     core::{PCWSTR, w},
 };
@@ -32,6 +35,24 @@ impl Rgba {
 
 pub fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain([0]).collect()
+}
+
+pub fn app_icon(path: &Path) -> Option<Rgba> {
+    let name = wide(path);
+    let size = 56;
+    // SAFETY: the icon thread initialized COM, the path is NUL-terminated,
+    // and read_bitmap consumes the returned HBITMAP.
+    unsafe {
+        SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(name.as_ptr()), None)
+            .and_then(|item| {
+                item.GetImage(
+                    SIZE { cx: size, cy: size },
+                    SIIGBF_ICONONLY | SIIGBF_SCALEUP,
+                )
+            })
+            .ok()
+            .and_then(read_bitmap)
+    }
 }
 
 pub fn file_description(path: &Path) -> Option<String> {

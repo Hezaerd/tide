@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     path::Path,
-    sync::{Weak, mpsc::Sender},
+    sync::Weak,
     time::{Duration, Instant},
 };
 
@@ -13,7 +13,7 @@ use rune::{
 use rune_kit::{ScrollBar, ScrollBarStyle};
 
 use crate::{
-    audio::{AppInfo, AppKey, Channel, Command, Peaks, Snapshot, Update},
+    audio::{AppInfo, AppKey, Channel, Command, CommandSender, Peaks, Snapshot, Update},
     theme::{self, Theme},
     tray::{self, Placement},
 };
@@ -57,7 +57,7 @@ pub struct State {
     peaks: Peaks,
     master_peak: Live<f32>,
     pixels: HashMap<AppKey, [Pixels; 2]>,
-    command: Option<Sender<Command>>,
+    command: Option<CommandSender>,
     window: Option<AppHandle<Self>>,
     tray: Weak<Tray>,
     panel: Panel,
@@ -88,7 +88,7 @@ impl State {
     }
 
     pub fn connected(
-        command: Sender<Command>,
+        command: CommandSender,
         master_peak: Live<f32>,
         window: AppHandle<Self>,
         tray: Weak<Tray>,
@@ -103,9 +103,7 @@ impl State {
     }
 
     fn send(&self, command: Command) -> bool {
-        self.command
-            .as_ref()
-            .is_some_and(|tx| tx.send(command).is_ok())
+        self.command.as_ref().is_some_and(|tx| tx.send(command))
     }
 
     pub fn toggle(&mut self, source: ToggleSource, tx: &mut Tx) {
@@ -215,21 +213,6 @@ impl State {
         }
     }
 
-    fn channel_mut(&mut self, channel: &Channel) -> Option<(&mut f32, &mut bool)> {
-        match channel {
-            Channel::Master => Some((
-                &mut self.snapshot.master_volume,
-                &mut self.snapshot.master_muted,
-            )),
-            Channel::App(key) => self
-                .snapshot
-                .apps
-                .iter_mut()
-                .find(|app| &app.key == key)
-                .map(|app| (&mut app.volume, &mut app.muted)),
-        }
-    }
-
     fn wheel(&mut self, channel: &Channel, event: WheelEvent, now: Instant) -> bool {
         if event.touch {
             return false;
@@ -270,7 +253,7 @@ impl State {
     }
 
     fn change(&mut self, channel: &Channel, change: Change) {
-        let Some((volume, muted)) = self.channel_mut(channel) else {
+        let Some((volume, muted)) = self.snapshot.channel_mut(channel) else {
             return;
         };
         let command = match change {
@@ -395,7 +378,7 @@ pub fn view(state: &State, cx: &mut Cx<State>) -> El {
         .children(snapshot.apps.iter().map(|app| {
             MixerRow {
                 channel: Channel::App(app.key.clone()),
-                name: &app.name,
+                name: app.name.as_str(),
                 volume: app.volume,
                 muted: app.muted,
                 streams: app.streams,
@@ -675,6 +658,7 @@ impl MixerRow<'_> {
                 if drag.phase == Phase::Down {
                     tx.focus(row_key.clone(), false);
                     drag.data = state
+                        .snapshot
                         .channel_mut(&channel)
                         .map_or(0.0, |(volume, _)| *volume);
                 }
