@@ -6,8 +6,8 @@ use std::{
 };
 
 use rune::{
-    AppHandle, Color, Cursor, Cx, El, Key, KeyEvent, LineCap, Live, Phase, Pixels, ScrollSpec,
-    Shape, Tray, Tx, canvas, col, el, row, text, tok::TextStyle,
+    AppHandle, Color, Cursor, Cx, El, GesturePhase, Key, KeyEvent, LineCap, Live, Phase, Pixels,
+    ScrollSpec, Shape, Tray, Tx, WheelEvent, canvas, col, el, row, text, tok::TextStyle,
 };
 
 use rune_kit::{ScrollBar, ScrollBarStyle};
@@ -24,6 +24,15 @@ const ROW_HEIGHT: f32 = 42.0;
 const TRACK_WIDTH: f32 = 204.0;
 const TRACK_HEIGHT: f32 = 6.0;
 const DEBOUNCE: Duration = Duration::from_millis(300);
+const WHEEL_VOLUME_STEP: f32 = 0.02;
+const SCROLL_POINTS_PER_STEP: f32 = 16.0;
+const UNPHASED_SCROLL_IDLE: Duration = Duration::from_millis(100);
+
+struct VolumeScroll {
+    channel: Channel,
+    remainder: f32,
+    last_event: Instant,
+}
 
 #[derive(Default)]
 enum Panel {
@@ -46,6 +55,7 @@ pub struct State {
     generation: u64,
     revision: u64,
     scene: Option<(bool, f32)>,
+    volume_scroll: Option<VolumeScroll>,
 }
 
 impl State {
@@ -63,6 +73,7 @@ impl State {
             generation: 0,
             revision: 0,
             scene: None,
+            volume_scroll: None,
         }
     }
 
@@ -143,6 +154,7 @@ impl State {
     }
 
     pub fn closed(&mut self, _: &mut Tx) {
+        self.volume_scroll = None;
         if !matches!(self.panel, Panel::Closed) {
             self.panel = Panel::Closed;
             self.send(Command::Close);
@@ -193,6 +205,45 @@ impl State {
         }
     }
 
+    fn wheel(&mut self, channel: &Channel, event: WheelEvent, now: Instant) -> bool {
+        if event.touch {
+            return false;
+        }
+        if event.momentum {
+            return true;
+        }
+        if event.notch && !event.precise {
+            self.volume_scroll = None;
+            if event.dy == 0.0 {
+                return false;
+            }
+            self.change(channel, Change::Step(event.dy.signum() * WHEEL_VOLUME_STEP));
+            return true;
+        }
+
+        let remainder = self.volume_scroll.as_ref().map_or(0.0, |scroll| {
+            // Windows sends fractional wheel events without gesture phases.
+            if &scroll.channel != channel
+                || event.phase == GesturePhase::Began
+                || (!event.precise && now.duration_since(scroll.last_event) >= UNPHASED_SCROLL_IDLE)
+            {
+                0.0
+            } else {
+                scroll.remainder
+            }
+        });
+        let (steps, remainder) = scroll_steps(remainder, event.dy);
+        self.volume_scroll = (event.phase != GesturePhase::Ended).then(|| VolumeScroll {
+            channel: channel.clone(),
+            remainder,
+            last_event: now,
+        });
+        if steps != 0.0 {
+            self.change(channel, Change::Step(steps * WHEEL_VOLUME_STEP));
+        }
+        true
+    }
+
     fn change(&mut self, channel: &Channel, change: Change) {
         let Some((volume, muted)) = self.channel_mut(channel) else {
             return;
@@ -220,6 +271,14 @@ impl State {
             self.revision += 1;
         }
     }
+}
+
+fn scroll_steps(remainder: f32, dy: f32) -> (f32, f32) {
+    let points = remainder + dy;
+    (
+        (points / SCROLL_POINTS_PER_STEP).trunc(),
+        points % SCROLL_POINTS_PER_STEP,
+    )
 }
 
 fn same_click(lost_focus_at: Option<Instant>, activated_at: Instant) -> bool {
@@ -452,13 +511,7 @@ impl MixerRow<'_> {
                 }
                 true
             })
-            .on_wheel(move |s: &mut State, event, _| {
-                if event.dy == 0.0 || event.precise || event.touch {
-                    return false;
-                }
-                s.change(&wheel, Change::Step(event.dy.signum() * 0.02));
-                true
-            })
+            .on_wheel(move |s: &mut State, event, _| s.wheel(&wheel, event, Instant::now()))
             .child(self.icon(t, key.clone()))
             .child(
                 col()
@@ -669,6 +722,67 @@ fn fake(state: &mut State, dark: bool, muted: bool, count: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_accumulates_small_deltas_and_keeps_the_remainder() {
+        let (steps, remainder) = scroll_steps(0.0, 7.5);
+        assert_eq!(steps, 0.0);
+        assert_eq!(scroll_steps(remainder, 29.0), (2.0, 4.5));
+    }
+
+    #[test]
+    fn scroll_steps_down_and_cancels_opposite_deltas() {
+        assert_eq!(scroll_steps(-6.0, -12.0), (-1.0, -2.0));
+        assert_eq!(scroll_steps(10.0, -17.0), (0.0, -7.0));
+    }
+
+    #[test]
+    fn a_new_gesture_or_channel_starts_without_the_previous_remainder() {
+        let mut state = State::new();
+        state.snapshot.master_volume = 0.5;
+        let now = Instant::now();
+        let master = Channel::Master;
+        let other = Channel::App(AppKey::for_process(42, None));
+        let delta = WheelEvent::new(0.0, 10.0).precise(true);
+
+        assert!(state.wheel(&master, delta, now));
+        state.wheel(&master, delta.phase(GesturePhase::Began), now);
+        assert_eq!(state.snapshot.master_volume, 0.5);
+
+        state.wheel(&other, delta, now);
+        state.wheel(&master, delta, now);
+        assert_eq!(state.snapshot.master_volume, 0.5);
+        state.wheel(&master, delta, now);
+        assert_eq!(state.snapshot.master_volume, 0.52);
+    }
+
+    #[test]
+    fn fractional_windows_wheel_deltas_drop_their_remainder_after_a_pause() {
+        let mut state = State::new();
+        state.snapshot.master_volume = 0.5;
+        let now = Instant::now();
+        let delta = WheelEvent::new(0.0, -10.0);
+        assert!(state.wheel(&Channel::Master, delta, now));
+        let next = now + Duration::from_millis(150);
+        state.wheel(&Channel::Master, delta, next);
+        assert_eq!(state.snapshot.master_volume, 0.5);
+        state.wheel(&Channel::Master, delta, next + Duration::from_millis(10));
+        assert_eq!(state.snapshot.master_volume, 0.48);
+    }
+
+    #[test]
+    fn momentum_is_consumed_and_a_notch_changes_volume_by_one_step() {
+        let mut state = State::new();
+        state.snapshot.master_volume = 0.5;
+        let now = Instant::now();
+        let mut momentum = WheelEvent::new(0.0, -64.0).precise(true);
+        momentum.momentum = true;
+        assert!(state.wheel(&Channel::Master, momentum, now));
+        assert_eq!(state.snapshot.master_volume, 0.5);
+        let notch = WheelEvent::new(0.0, 120.0).notch(true);
+        assert!(state.wheel(&Channel::Master, notch, now));
+        assert_eq!(state.snapshot.master_volume, 0.52);
+    }
 
     #[test]
     fn clicking_the_tray_after_it_takes_focus_does_not_reopen() {
