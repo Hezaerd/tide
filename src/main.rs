@@ -1,7 +1,6 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod audio;
-mod autostart;
 mod icon;
 mod theme;
 mod tray;
