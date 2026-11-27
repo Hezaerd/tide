@@ -7,6 +7,7 @@ Tide is a Windows tray volume mixer built with Rune. Clicking the tray icon open
 - `src/audio.rs` is the only module that calls WASAPI. It runs on its own COM thread, takes `Command`s over a channel, and publishes `Snapshot`s to the UI.
 - `src/ui.rs` holds the pop-up state and view. `src/tray.rs` owns the tray icon and its menu. `src/theme.rs` holds the light and dark tokens. `src/icon.rs` extracts app icons and accent colours. `winshell` manages "Start with Windows" and selects the taskbar mark for `src/tray.rs`.
 - `assets/` holds the tray marks. Regenerate the PNGs with `scripts/generate-wave.py` rather than editing them by hand.
+- `installer/tide.iss` defines the per-user Windows installer.
 - Rune is pinned to one git rev in `Cargo.toml`, together with the `[patch.crates-io]` block. Change all of them together.
 
 ## Rules
@@ -32,3 +33,9 @@ For a change to the audio thread, also run `cargo test -- --ignored`. It changes
 For a change that affects the tray or the pop-up, build the release binary and run `scripts/verify-windows.ps1` with Tide closed. It uses the real mouse and keyboard, and pins the tray icon if Windows hid it in the overflow menu. It checks that the pop-up opens and closes, prints how long each open took, and saves a capture to `target/verify/popup.png`. Look at the capture.
 
 Write commits as Conventional Commits (`feat: …`, `fix: …`, `docs: …`, `chore: …`).
+
+## Releasing
+
+Bump `version` in `Cargo.toml` and run `cargo build` to update `Cargo.lock`.
+Commit the version bump and push a tag `vX.Y.Z` that matches the version.
+The Release workflow builds and publishes the installer and portable executable.
